@@ -27,7 +27,7 @@ UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
 
 app = FastAPI(
-    title="RAG Chatbot API",
+    title="RAGnarok API",
     description="A Retrieval-Augmented Generation chatbot API with memory",
     version="1.0.0"
 )
@@ -284,12 +284,24 @@ async def ask_question(query: Query):
         # Process the question
         logger.info(f"Invoking RAG chain with question: {query.input}")
         
-        # Force using the exact question without rephrasing
-        question = query.input
-        result = invoke_with_retry(rag_chain, {"question": question})
+        # Get the result from the chain
+        result = invoke_with_retry(rag_chain, {"question": query.input})
         
-        # More detailed logging of the result
-        logger.info(f"RAG chain result keys: {result.keys() if result else 'None'}")
+        # # Format the response as JSON
+        # response = {
+        #     "answer": result["answer"],
+        #     "sources": []
+        # }
+        
+        # # Add source documents if available
+        # if "source_documents" in result:
+        #     response["sources"] = [
+        #         {
+        #             "content": doc.page_content,
+        #             "page": doc.metadata.get("page", None)
+        #         }
+        #         for doc in result["source_documents"]
+        #     ]
         
         # Log memory state after processing 
         logger.info("Checking if memory summary was updated")
@@ -344,9 +356,15 @@ async def ask_question(query: Query):
             )
 
         # Expecting the LLM to return JSON string with "answer" and "sources"
-        import json
+        
+        import json, re
         try:
-            parsed = json.loads(result["answer"])
+            raw_answer = result["answer"]
+            # Strip code fences if present
+            if raw_answer.strip().startswith("```"):
+                raw_answer = re.sub(r"^```[a-zA-Z]*", "", raw_answer.strip())
+                raw_answer = re.sub(r"```$", "", raw_answer.strip())
+            parsed = json.loads(raw_answer.strip())
             if not all(k in parsed for k in ["answer", "sources"]):
                 raise ValueError("Missing required keys in LLM JSON output")
         except Exception as e:
@@ -358,7 +376,10 @@ async def ask_question(query: Query):
 
         return {
             "answer": parsed["answer"],
-            "sources": parsed["sources"]
+            "sources": parsed["sources"],
+            "timestamp": datetime.now().isoformat(),
+            "document": active_document            
+            # "refused": parsed.get("refused", False)
         }
     except HTTPException:
         raise
