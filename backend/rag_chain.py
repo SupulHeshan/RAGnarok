@@ -20,6 +20,7 @@ import time
 import logging
 import sqlite3
 from dotenv import load_dotenv
+from SQLite import init_db, DB_PATH, SIMILARITY_THRESHOLD
 from typing import Optional, List, Tuple
 import hashlib
 import json
@@ -30,60 +31,10 @@ import numpy as np
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ────────────────────────────────────────────────────────────────────────────
 #  Load environment variables (.env should contain MISTRAL_API_KEY=sk‑***)
-# ────────────────────────────────────────────────────────────────────────────
 load_dotenv()
 
-# ────────────────────────────────────────────────────────────────────────────
 # Database setup (SQLite)
-# ────────────────────────────────────────────────────────────────────────────
-
-DB_PATH = str(Path(__file__).resolve().parent / "documents.db")
-SIMILARITY_THRESHOLD = 0.5  # configurable threshold for refusal
-
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    # Ensure fresh schema by dropping both tables before recreation
-    c.execute("DROP TABLE IF EXISTS chunks")
-    c.execute("DROP TABLE IF EXISTS documents")
-    c.execute("DROP TABLE IF EXISTS retrieval_cache")
-    c.execute("""
-        CREATE TABLE documents (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT,
-            path TEXT,
-            size_bytes INTEGER,
-            uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    c.execute("""
-        CREATE TABLE chunks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            doc_id INTEGER,
-            chunk_index INTEGER,
-            text TEXT,
-            page INTEGER,
-            embedding BLOB,
-            FOREIGN KEY(doc_id) REFERENCES documents(id)
-        )
-    """)
-    # Cache retrieval results for deterministic grounding: keyed by (qhash, doc_id, k)
-    c.execute("""
-        CREATE TABLE retrieval_cache (
-            qhash TEXT,
-            doc_id INTEGER,
-            k INTEGER,
-            query TEXT,
-            result TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            PRIMARY KEY (qhash, doc_id, k)
-        )
-    """)
-    conn.commit()
-    conn.close()
-
 init_db()
 
 
