@@ -1,0 +1,47 @@
+# =========================
+# Python
+# =========================
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+*.log
+
+# Virtual environments
+venv/
+env/
+
+# =========================
+# Project-specific
+# =========================
+
+uploads/
+
+# Config / secrets
+*.env
+
+# Docker related temp/config files
+Dockerfile_elements.txt
+docker-compose_elements.txt
+
+
+
+# =========================
+# IDE / Editor junk
+# =========================
+.vscode/
+.idea/
+*.iml
+
+# =========================
+# OS generated files
+# =========================
+.DS_Store
+Thumbs.db
+documents.db
+
+backend/test.py
+backend/testapi.py
