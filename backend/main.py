@@ -10,6 +10,7 @@ import shutil
 from typing import List
 from datetime import datetime
 from pathlib import Path
+import json, re
 
 # Configure logging with more detailed format
 logging.basicConfig(
@@ -276,150 +277,68 @@ async def get_history():
 # Main Q&A route with improved error handling
 @app.post("/Chat")
 async def ask_question(query: Query):
-    """Process a question using the RAG chain"""
     try:
-        # Log memory state before processing
         log_memory_state("Before processing")
-        
-        # Process the question
         logger.info(f"Invoking RAG chain with question: {query.input}")
-        
-        # Get the result from the chain
         result = invoke_with_retry(rag_chain, {"question": query.input})
-        
-        # # Format the response as JSON
-        # response = {
-        #     "answer": result["answer"],
-        #     "sources": []
-        # }
-        
-        # # Add source documents if available
-        # if "source_documents" in result:
-        #     response["sources"] = [
-        #         {
-        #             "content": doc.page_content,
-        #             "page": doc.metadata.get("page", None)
-        #         }
-        #         for doc in result["source_documents"]
-        #     ]
-        
-        # Log memory state after processing 
         logger.info("Checking if memory summary was updated")
         log_memory_state("After processing")
-        
-        if hasattr(rag_chain, 'memory') and rag_chain.memory is not None:
-            memory = rag_chain.memory
-            # Force memory to generate a new summary if empty
-            if hasattr(memory, 'buffer') and not memory.buffer and hasattr(memory, 'predict_new_summary'):
-                logger.info("Attempting to force summary generation")
-                try:
-                    if hasattr(memory, 'chat_memory') and memory.chat_memory is not None and hasattr(memory.chat_memory, 'messages'):
-                        if len(memory.chat_memory.messages) >= 2:  # Need at least a human and AI message
-                            logger.info(f"Found {len(memory.chat_memory.messages)} messages, generating summary")
-                            # Try to manually generate summary
-                            memory.buffer = memory.predict_new_summary(
-                                memory.buffer or "", memory.chat_memory.messages[-2:]
-                            )
-                            logger.info(f"Forced summary generation: {memory.buffer}")
-                except Exception as e:
-                    logger.error(f"Error forcing summary generation: {str(e)}")
-            # Backward compatibility
-            elif hasattr(memory, 'moving_summary_buffer') and not memory.moving_summary_buffer and hasattr(memory, 'predict_new_summary'):
-                # Similar logic for legacy attribute - kept for backward compatibility
-                logger.info("Attempting to force legacy summary generation")
-                try:
-                    if hasattr(memory, 'chat_memory') and memory.chat_memory is not None and hasattr(memory.chat_memory, 'messages'):
-                        if len(memory.chat_memory.messages) >= 2:
-                            memory.moving_summary_buffer = memory.predict_new_summary(
-                                memory.moving_summary_buffer or "", memory.chat_memory.messages[-2:]
-                            )
-                            logger.info(f"Forced legacy summary generation: {memory.moving_summary_buffer}")
-                except Exception as e:
-                    logger.error(f"Error forcing legacy summary generation: {str(e)}")
-        
-        # if result is None:
-        #     raise HTTPException(
-        #         status_code=503,
-        #         detail="Service temporarily unavailable due to rate limiting"
-        #     )
-        
-        # return {
-        #     "answer": result["answer"],
-        #     "timestamp": datetime.now().isoformat(),
-        #     "document": active_document
-        # }
-    
-        if result is None:
-            raise HTTPException(
-                status_code=503,
-                detail="Service temporarily unavailable due to rate limiting"
-            )
 
-        # Expecting the LLM to return JSON string with "answer" and "sources"
-        
-        import json, re
+        if result is None:
+            raise HTTPException(status_code=503, detail="Service temporarily unavailable due to rate limiting")
+
         try:
             raw_answer = result["answer"]
-            # Strip code fences if present
-            if raw_answer.strip().startswith("```"):
-                raw_answer = re.sub(r"^```[a-zA-Z]*", "", raw_answer.strip())
-                raw_answer = re.sub(r"```$", "", raw_answer.strip())
-            parsed = json.loads(raw_answer.strip())
+            # Clean LLM output (remove fences and stray backticks)
+            cleaned = re.sub(r"^```[a-zA-Z]*", "", raw_answer.strip())
+            cleaned = re.sub(r"```", "", cleaned)
+            cleaned = cleaned.strip()
+
+            # Ensure valid JSON by fixing common issues like unescaped newlines
+            # Replace raw newlines inside string values with spaces
+            cleaned = re.sub(r"\n(\s+)?", " ", cleaned)
+
+            parsed = json.loads(cleaned)
             if not all(k in parsed for k in ["answer", "sources"]):
                 raise ValueError("Missing required keys in LLM JSON output")
         except Exception as e:
-            logger.error(f"Failed to parse LLM JSON answer: {str(e)}")
-            raise HTTPException(
-                status_code=500,
-                detail="Invalid JSON format returned from LLM"
-            )
+            logger.error(f"Failed to parse LLM JSON answer. Raw output was: {raw_answer}")
+            raise HTTPException(status_code=500, detail="Invalid JSON format returned from LLM")
 
         return {
             "answer": parsed["answer"],
             "sources": parsed["sources"],
-            "timestamp": datetime.now().isoformat(),
-            "document": active_document            
-            # "refused": parsed.get("refused", False)
+            # "timestamp": datetime.now().isoformat(),
+            # "document": active_document,
         }
+    
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Error in ask_question: {str(e)}", exc_info=True)
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error processing request: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"Error processing request: {str(e)}")
 
 def log_memory_state(stage: str):
-    """Helper function to log memory state"""
     if hasattr(rag_chain, 'memory') and rag_chain.memory is not None:
         memory = rag_chain.memory
         logger.info(f"{stage} - Memory attributes: {list(vars(memory).keys())}")
-        
-        # Check for summary
         if hasattr(memory, 'buffer'):
             summary = memory.buffer
             logger.info(f"{stage} - Summary buffer exists: {bool(summary)}")
             logger.info(f"{stage} - Summary type: {type(summary)}")
             logger.info(f"{stage} - Summary length: {len(summary) if summary else 0}")
             logger.info(f"{stage} - Summary content: '{summary}'")
-        elif hasattr(memory, 'moving_summary_buffer'):  # Fallback for backward compatibility
+        elif hasattr(memory, 'moving_summary_buffer'):
             summary = memory.moving_summary_buffer
             logger.info(f"{stage} - Legacy summary buffer exists: {bool(summary)}")
             logger.info(f"{stage} - Legacy summary type: {type(summary)}")
             logger.info(f"{stage} - Legacy summary length: {len(summary) if summary else 0}")
             logger.info(f"{stage} - Legacy summary content: '{summary}'")
-        else:
-            logger.info(f"{stage} - No summary buffer attribute found")
-            
-        # Check for chat messages
         if hasattr(memory, 'chat_memory') and hasattr(memory.chat_memory, 'messages'):
             messages = memory.chat_memory.messages
             logger.info(f"{stage} - Message count: {len(messages)}")
             if messages:
                 logger.info(f"{stage} - Last message: {messages[-1]}")
-        else:
-            logger.info(f"{stage} - No chat messages found")
 
 # Activate document with improved error handling
 @app.post("/activate-document/{filename}")

@@ -252,7 +252,7 @@ Guidelines:
 7. Never invent information not present in the context or chat history.
 8. If retrieval scores are too low, answer="I don't have information about that in my knowledge base." with empty sources.
 
-Return ONLY a valid JSON object, no extra text.
+Return ONLY a valid JSON object, same as exactly example output. no extra text.
 """
     )
 
@@ -270,24 +270,6 @@ Return ONLY a valid JSON object, no extra text.
     )
     return rag_chain
 
-
-
-
-    # # 6️⃣  Build improved Conversational Retrieval chain
-    # rag_chain = ConversationalRetrievalChain.from_llm(
-    #     llm=qa_llm,
-    #     retriever=retriever,
-    #     memory=memory,
-    #     combine_docs_chain_kwargs={"prompt": qa_prompt},
-    #     verbose=True,
-    #     return_source_documents=True,
-    #     return_generated_question=False,  # Don't return the generated question
-    #     rephrase_question=False,  # Disable question rephrasing
-    # )
-    
-    # logger.info("Created improved RAG chain with disabled question rephrasing")
-    
-    # return rag_chain
 
 
 # ────────────────────────────────────────────────────────────────────────────
