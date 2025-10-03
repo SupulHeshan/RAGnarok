@@ -3,14 +3,15 @@ from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
-from rag_chain import get_rag_chain, invoke_with_retry
+from rag_chain import get_rag_chain, invoke_with_retry, DB_PATH
 import logging
 import os
 import shutil
-from typing import List
+from typing import List, Optional
 from datetime import datetime
 from pathlib import Path
 import json, re
+import sqlite3
 
 # Configure logging with more detailed format
 logging.basicConfig(
@@ -169,6 +170,16 @@ async def update_rag_chain(file_location: Path):
         active_document = str(file_location)
         rag_chain = get_rag_chain(document_path=active_document)
         logger.info(f"Successfully updated RAG chain with {file_location}")
+        # Clear retrieval cache after re-embedding a document to avoid stale results
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            c.execute("DELETE FROM retrieval_cache")
+            conn.commit()
+            conn.close()
+            logger.info('Cleared retrieval cache after updating RAG chain')
+        except Exception as e:
+            logger.warning(f'Failed to clear retrieval cache: {e}')
     except Exception as e:
         logger.error(f"Failed to update RAG chain: {str(e)}")
         raise HTTPException(
@@ -308,8 +319,8 @@ async def ask_question(query: Query):
         return {
             "answer": parsed["answer"],
             "sources": parsed["sources"],
-            # "timestamp": datetime.now().isoformat(),
-            # "document": active_document,
+            "timestamp": datetime.now().isoformat(),
+            "document": active_document,
         }
     
     except HTTPException:
@@ -383,6 +394,41 @@ async def activate_document(filename: str):
             detail=f"Failed to activate document: {str(e)}"
         )
 
+
+@app.post("/clear-retrieval-cache")
+async def clear_retrieval_cache(doc_id: Optional[int] = None):
+    """Clear retrieval cache entirely or for a specific document id."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        if doc_id is None:
+            c.execute("DELETE FROM retrieval_cache")
+            logger.info('Cleared entire retrieval cache')
+        else:
+            c.execute("DELETE FROM retrieval_cache WHERE doc_id=?", (doc_id,))
+            logger.info(f'Cleared retrieval cache for doc_id={doc_id}')
+        conn.commit()
+        conn.close()
+        return {"status": "success", "doc_id": doc_id}
+    except Exception as e:
+        logger.error(f"Failed to clear retrieval cache: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/cache-status")
+async def cache_status(limit: int = 10):
+    """Return simple stats and a small sample of retrieval_cache rows for debugging."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        count = c.execute("SELECT count(*) FROM retrieval_cache").fetchone()[0]
+        sample = c.execute("SELECT qhash, doc_id, k, length(result), created_at FROM retrieval_cache ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
+        conn.close()
+        return {"count": count, "sample": sample}
+    except Exception as e:
+        logger.error(f"Failed to read retrieval cache status: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 # Reset memory endpoint
 @app.post("/reset-chat-memory")
 async def reset_chat_memory():
@@ -451,4 +497,78 @@ async def reset_document_memory():
         raise HTTPException(
             status_code=500,
             detail=f"Failed to reset document memory: {str(e)}"
+        )
+
+# Force summary generation endpoint
+@app.post("/generate-summary")
+async def generate_summary():
+    """Force generation of conversation summary"""
+    try:
+        if hasattr(rag_chain, 'memory') and rag_chain.memory is not None:
+            memory = rag_chain.memory
+            
+            if hasattr(memory, 'chat_memory') and memory.chat_memory is not None and hasattr(memory.chat_memory, 'messages'):
+                messages = memory.chat_memory.messages
+                
+                if len(messages) < 2:
+                    return {
+                        "status": "warning",
+                        "message": "Not enough messages to generate a summary (need at least one human and one AI message)",
+                        "timestamp": datetime.now().isoformat()
+                    }
+                
+                # Try to manually generate summary
+                if hasattr(memory, 'predict_new_summary'):
+                    old_summary = ""
+                    
+                    # Get existing summary
+                    if hasattr(memory, 'buffer'):
+                        old_summary = memory.buffer or ""
+                    elif hasattr(memory, 'moving_summary_buffer'):
+                        old_summary = memory.moving_summary_buffer or ""
+                    
+                    # Generate new summary
+                    new_summary = memory.predict_new_summary(
+                        old_summary, 
+                        messages
+                    )
+                    
+                    # Store the new summary
+                    if hasattr(memory, 'buffer'):
+                        memory.buffer = new_summary
+                    elif hasattr(memory, 'moving_summary_buffer'):
+                        memory.moving_summary_buffer = new_summary
+                    
+                    logger.info(f"Manually generated summary: {new_summary}")
+                    
+                    return {
+                        "status": "success",
+                        "message": "Summary generated successfully",
+                        "summary": new_summary,
+                        "old_summary": old_summary,
+                        "timestamp": datetime.now().isoformat()
+                    }
+                else:
+                    return {
+                        "status": "error",
+                        "message": "Memory doesn't have predict_new_summary method",
+                        "timestamp": datetime.now().isoformat()
+                    }
+            else:
+                return {
+                    "status": "error",
+                    "message": "No chat messages found in memory",
+                    "timestamp": datetime.now().isoformat()
+                }
+        else:
+            return {
+                "status": "error",
+                "message": "No memory available",
+                "timestamp": datetime.now().isoformat()
+            }
+    except Exception as e:
+        logger.error(f"Error generating summary: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error generating summary: {str(e)}"
         )

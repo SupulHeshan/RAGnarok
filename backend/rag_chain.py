@@ -1,9 +1,8 @@
 """
-Improved Retrieval‑Augmented Generation (RAG) chain that:
+Improved Retrieval-Augmented Generation (RAG) chain that:
   • Uses smaller, strategic text chunks for more precise retrieval
   • Implements similarity search with limited results
   • Handles off-topic questions properly
-  • Maintains conversation memory with summaries
   • Supports multiple document formats including PDFs
 """
 
@@ -13,8 +12,8 @@ from langchain_mistralai.embeddings import MistralAIEmbeddings
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_core.prompts import ChatPromptTemplate
 from langchain.chains import ConversationalRetrievalChain
-from langchain.memory import ConversationSummaryMemory
 from langchain.schema import BaseRetriever, Document
+from langchain.memory import ConversationSummaryMemory
 
 import os
 import time
@@ -22,6 +21,8 @@ import logging
 import sqlite3
 from dotenv import load_dotenv
 from typing import Optional, List, Tuple
+import hashlib
+import json
 from pathlib import Path
 import numpy as np
 
@@ -38,7 +39,7 @@ load_dotenv()
 # Database setup (SQLite)
 # ────────────────────────────────────────────────────────────────────────────
 
-DB_PATH = "documents.db"
+DB_PATH = str(Path(__file__).resolve().parent / "documents.db")
 SIMILARITY_THRESHOLD = 0.5  # configurable threshold for refusal
 
 def init_db():
@@ -47,6 +48,7 @@ def init_db():
     # Ensure fresh schema by dropping both tables before recreation
     c.execute("DROP TABLE IF EXISTS chunks")
     c.execute("DROP TABLE IF EXISTS documents")
+    c.execute("DROP TABLE IF EXISTS retrieval_cache")
     c.execute("""
         CREATE TABLE documents (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -65,6 +67,18 @@ def init_db():
             page INTEGER,
             embedding BLOB,
             FOREIGN KEY(doc_id) REFERENCES documents(id)
+        )
+    """)
+    # Cache retrieval results for deterministic grounding: keyed by (qhash, doc_id, k)
+    c.execute("""
+        CREATE TABLE retrieval_cache (
+            qhash TEXT,
+            doc_id INTEGER,
+            k INTEGER,
+            query TEXT,
+            result TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (qhash, doc_id, k)
         )
     """)
     conn.commit()
@@ -124,24 +138,66 @@ def embed_and_store(document_path: str, chunks, embeddings_model) -> int:
     return doc_id
 
 def retrieve_top_k(query: str, k: int, embeddings_model, doc_id: Optional[int] = None) -> List[Tuple[str, int, float]]:
-    query_emb = np.array(embeddings_model.embed_query(query), dtype=np.float32)
+    # Deterministic grounding: cache retrieval results per normalized question hash
+    def normalize_q(q: str) -> str:
+        # Lowercase, strip whitespace, collapse internal whitespace
+        s = " ".join(q.strip().lower().split())
+        return s
+
+    qnorm = normalize_q(query)
+    qhash = hashlib.sha256(qnorm.encode('utf-8')).hexdigest()
+
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
+
+    # Check cache first
+    c.execute("SELECT result FROM retrieval_cache WHERE qhash=? AND doc_id IS ? AND k=?", (qhash, doc_id, k))
+    row = c.fetchone()
+    if row:
+        try:
+            serialized = row[0]
+            parsed = json.loads(serialized)
+            # parsed expected to be list of [text, page, score]
+            logger.info(f"Retrieval cache HIT for qhash={qhash} doc_id={doc_id} k={k}")
+            conn.close()
+            return [(t, p, float(s)) for t, p, s in parsed]
+        except Exception:
+            # Fallthrough to compute if cache deserialization fails
+            logger.warning('Failed to deserialize retrieval cache; recomputing')
+
+    # No cache hit — compute embeddings and scores
+    query_emb = np.array(embeddings_model.embed_query(query), dtype=np.float32)
     if doc_id:
         c.execute("SELECT id, text, page, embedding FROM chunks WHERE doc_id=?", (doc_id,))
     else:
         c.execute("SELECT id, text, page, embedding FROM chunks")
     rows = c.fetchall()
-    conn.close()
 
     scored = []
     for chunk_id, text, page, emb_bytes in rows:
         emb = np.frombuffer(emb_bytes, dtype=np.float32)
-        sim = np.dot(query_emb, emb) / (np.linalg.norm(query_emb) * np.linalg.norm(emb))
+        # avoid zero division
+        denom = (np.linalg.norm(query_emb) * np.linalg.norm(emb))
+        sim = 0.0
+        if denom != 0:
+            sim = float(np.dot(query_emb, emb) / denom)
         scored.append((text, page, sim))
-    
+
     scored.sort(key=lambda x: x[2], reverse=True)
-    return scored[:k]
+    topk = scored[:k]
+
+    # Store in cache for future deterministic grounding
+    try:
+        serialized = json.dumps([[t, p, s] for t, p, s in topk])
+        c.execute("INSERT OR REPLACE INTO retrieval_cache (qhash, doc_id, k, query, result) VALUES (?, ?, ?, ?, ?)",
+                  (qhash, doc_id, k, qnorm, serialized))
+        conn.commit()
+        logger.info(f"Stored retrieval cache for qhash={qhash} doc_id={doc_id} k={k} entries={len(topk)}")
+    except Exception:
+        logger.warning('Failed to write to retrieval cache')
+
+    conn.close()
+    return topk
 
 # ────────────────────────────────────────────────────────────────────────────
 #  Custom BaseRetriever implementation
@@ -156,6 +212,7 @@ class SQLiteRetriever(BaseRetriever):
         # No need to set attributes manually as they are handled by Pydantic
 
     def _get_relevant_documents(self, query: str) -> List[Document]:
+        logger.info(f"SQLiteRetriever invoked for doc_id={self.doc_id} query='{query[:80]}'")
         top_chunks = retrieve_top_k(query, 3, self.embeddings_model, self.doc_id)
         filtered = [(text, page, score) for text, page, score in top_chunks if score >= self.threshold]
         return [Document(page_content=text, metadata={"page": page, "score": score}) for text, page, score in filtered]
@@ -201,13 +258,13 @@ def get_rag_chain(document_path="essay.txt"):
     doc_id = embed_and_store(document_path, chunks, embeddings)
 
     # 3️⃣  Set up language models
-    # Higher temperature for more creative summaries
+       # Higher temperature for more creative summaries
     summary_llm = ChatMistralAI(
         mistral_api_key=api_key, 
         temperature=0.3,
         model="mistral-large-latest"
     )
-    
+
     # Lower temperature for factual answers
     qa_llm = ChatMistralAI(
         mistral_api_key=api_key, 
@@ -227,9 +284,8 @@ def get_rag_chain(document_path="essay.txt"):
     )
     
     logger.info("Created conversation summary memory")
- 
 
-    #5️⃣ Prompt enforcing inline citations + JSON sources
+    # 5️⃣ Prompt enforcing inline citations + JSON sources
     qa_prompt = ChatPromptTemplate.from_template(
         """You are an assistant that answers user clinical questions strictly using only the provided context snippets.
 <context>
