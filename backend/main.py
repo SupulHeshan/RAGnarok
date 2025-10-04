@@ -394,7 +394,7 @@ async def activate_document(filename: str):
             detail=f"Failed to activate document: {str(e)}"
         )
 
-
+""" Using these can clear the retrieval cache, which may be useful after re-embedding a document."""
 # @app.post("/clear-retrieval-cache")
 # async def clear_retrieval_cache(doc_id: Optional[int] = None):
 #     """Clear retrieval cache entirely or for a specific document id."""
