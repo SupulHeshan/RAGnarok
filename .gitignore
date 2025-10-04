@@ -45,3 +45,4 @@ documents.db
 
 backend/test.py
 backend/testapi.py
+vectorstores/

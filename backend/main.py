@@ -7,7 +7,7 @@ from rag_chain import get_rag_chain, invoke_with_retry, DB_PATH
 import logging
 import os
 import shutil
-from typing import List, Optional
+from typing import List
 from datetime import datetime
 from pathlib import Path
 import json, re
@@ -395,39 +395,39 @@ async def activate_document(filename: str):
         )
 
 
-@app.post("/clear-retrieval-cache")
-async def clear_retrieval_cache(doc_id: Optional[int] = None):
-    """Clear retrieval cache entirely or for a specific document id."""
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        if doc_id is None:
-            c.execute("DELETE FROM retrieval_cache")
-            logger.info('Cleared entire retrieval cache')
-        else:
-            c.execute("DELETE FROM retrieval_cache WHERE doc_id=?", (doc_id,))
-            logger.info(f'Cleared retrieval cache for doc_id={doc_id}')
-        conn.commit()
-        conn.close()
-        return {"status": "success", "doc_id": doc_id}
-    except Exception as e:
-        logger.error(f"Failed to clear retrieval cache: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+# @app.post("/clear-retrieval-cache")
+# async def clear_retrieval_cache(doc_id: Optional[int] = None):
+#     """Clear retrieval cache entirely or for a specific document id."""
+#     try:
+#         conn = sqlite3.connect(DB_PATH)
+#         c = conn.cursor()
+#         if doc_id is None:
+#             c.execute("DELETE FROM retrieval_cache")
+#             logger.info('Cleared entire retrieval cache')
+#         else:
+#             c.execute("DELETE FROM retrieval_cache WHERE doc_id=?", (doc_id,))
+#             logger.info(f'Cleared retrieval cache for doc_id={doc_id}')
+#         conn.commit()
+#         conn.close()
+#         return {"status": "success", "doc_id": doc_id}
+#     except Exception as e:
+#         logger.error(f"Failed to clear retrieval cache: {str(e)}")
+#         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/cache-status")
-async def cache_status(limit: int = 10):
-    """Return simple stats and a small sample of retrieval_cache rows for debugging."""
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        count = c.execute("SELECT count(*) FROM retrieval_cache").fetchone()[0]
-        sample = c.execute("SELECT qhash, doc_id, k, length(result), created_at FROM retrieval_cache ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
-        conn.close()
-        return {"count": count, "sample": sample}
-    except Exception as e:
-        logger.error(f"Failed to read retrieval cache status: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+# @app.get("/cache-status")
+# async def cache_status(limit: int = 10):
+#     """Return simple stats and a small sample of retrieval_cache rows for debugging."""
+#     try:
+#         conn = sqlite3.connect(DB_PATH)
+#         c = conn.cursor()
+#         count = c.execute("SELECT count(*) FROM retrieval_cache").fetchone()[0]
+#         sample = c.execute("SELECT qhash, doc_id, k, length(result), created_at FROM retrieval_cache ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
+#         conn.close()
+#         return {"count": count, "sample": sample}
+#     except Exception as e:
+#         logger.error(f"Failed to read retrieval cache status: {str(e)}")
+#         raise HTTPException(status_code=500, detail=str(e))
 
 # Reset memory endpoint
 @app.post("/reset-chat-memory")

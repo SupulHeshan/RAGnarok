@@ -26,6 +26,7 @@ import hashlib
 import json
 from pathlib import Path
 import numpy as np
+from langchain_community.vectorstores import FAISS
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -36,6 +37,10 @@ load_dotenv()
 
 # Database setup (SQLite)
 init_db()
+
+# Directory for FAISS vectorstores (one per document)
+VECTORSTORE_DIR = Path(__file__).resolve().parent / "vectorstores"
+VECTORSTORE_DIR.mkdir(parents=True, exist_ok=True)
 
 
 
@@ -86,6 +91,18 @@ def embed_and_store(document_path: str, chunks, embeddings_model) -> int:
                   (doc_id, idx, ch.page_content, ch.metadata.get("page", None), emb_bytes))
     conn.commit()
     conn.close()
+
+    # Build FAISS vectorstore for this document to accelerate retrieval on large PDFs
+    try:
+        faiss_index = FAISS.from_documents(chunks, embeddings_model)
+        index_dir = VECTORSTORE_DIR / f"doc_{doc_id}"
+        # ensure index path exists
+        index_dir.mkdir(parents=True, exist_ok=True)
+        faiss_index.save_local(str(index_dir))
+        logger.info(f"Saved FAISS index for doc_id={doc_id} at {index_dir}")
+    except Exception as e:
+        logger.warning(f"Failed to build/save FAISS index for doc_id={doc_id}: {e}")
+
     return doc_id
 
 def retrieve_top_k(query: str, k: int, embeddings_model, doc_id: Optional[int] = None) -> List[Tuple[str, int, float]]:
@@ -116,26 +133,41 @@ def retrieve_top_k(query: str, k: int, embeddings_model, doc_id: Optional[int] =
             # Fallthrough to compute if cache deserialization fails
             logger.warning('Failed to deserialize retrieval cache; recomputing')
 
-    # No cache hit — compute embeddings and scores
-    query_emb = np.array(embeddings_model.embed_query(query), dtype=np.float32)
-    if doc_id:
-        c.execute("SELECT id, text, page, embedding FROM chunks WHERE doc_id=?", (doc_id,))
-    else:
-        c.execute("SELECT id, text, page, embedding FROM chunks")
-    rows = c.fetchall()
+    # No cache hit — prefer FAISS vectorstore if available for this document
+    topk: List[Tuple[str, int, float]] = []
+    if doc_id is not None:
+        index_dir = VECTORSTORE_DIR / f"doc_{doc_id}"
+        if index_dir.exists():
+            try:
+                faiss_index = FAISS.load_local(str(index_dir), embeddings_model)
+                docs_and_scores = faiss_index.similarity_search_with_score(query, k=k)
+                for doc, score in docs_and_scores:
+                    page = doc.metadata.get('page') if getattr(doc, 'metadata', None) else None
+                    topk.append((doc.page_content, page, float(score)))
+            except Exception as e:
+                logger.warning(f"Failed to use FAISS index for doc_id={doc_id}: {e}. Falling back to SQLite scoring.")
 
-    scored = []
-    for chunk_id, text, page, emb_bytes in rows:
-        emb = np.frombuffer(emb_bytes, dtype=np.float32)
-        # avoid zero division
-        denom = (np.linalg.norm(query_emb) * np.linalg.norm(emb))
-        sim = 0.0
-        if denom != 0:
-            sim = float(np.dot(query_emb, emb) / denom)
-        scored.append((text, page, sim))
+    # If FAISS not used or produced no results, fallback to SQLite scoring
+    if not topk:
+        query_emb = np.array(embeddings_model.embed_query(query), dtype=np.float32)
+        if doc_id:
+            c.execute("SELECT id, text, page, embedding FROM chunks WHERE doc_id=?", (doc_id,))
+        else:
+            c.execute("SELECT id, text, page, embedding FROM chunks")
+        rows = c.fetchall()
 
-    scored.sort(key=lambda x: x[2], reverse=True)
-    topk = scored[:k]
+        scored = []
+        for chunk_id, text, page, emb_bytes in rows:
+            emb = np.frombuffer(emb_bytes, dtype=np.float32)
+            # avoid zero division
+            denom = (np.linalg.norm(query_emb) * np.linalg.norm(emb))
+            sim = 0.0
+            if denom != 0:
+                sim = float(np.dot(query_emb, emb) / denom)
+            scored.append((text, page, sim))
+
+        scored.sort(key=lambda x: x[2], reverse=True)
+        topk = scored[:k]
 
     # Store in cache for future deterministic grounding
     try:
