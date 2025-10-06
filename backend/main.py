@@ -298,22 +298,124 @@ async def ask_question(query: Query):
         if result is None:
             raise HTTPException(status_code=503, detail="Service temporarily unavailable due to rate limiting")
 
+        def extract_json_from_text(text: str):
+            """Robustly extract a JSON object/array from a model string.
+            - strip common code fences
+            - find first brace/bracket and match to the closing one
+            - try a few heuristics (remove trailing commas) if parse fails
+            """
+            if not isinstance(text, str):
+                raise ValueError("LLM returned non-string answer")
+
+            s = text.strip()
+            # remove leading/trailing code fences like ```json or ```
+            s = re.sub(r"^```(?:json|\w+)?\s*", "", s, flags=re.I)
+            s = re.sub(r"\s*```$", "", s)
+
+            # try direct load first
+            try:
+                return json.loads(s)
+            except Exception:
+                pass
+
+            # find first JSON boundary - look for { or [
+            start = None
+            for i, ch in enumerate(s):
+                if ch in '{[':
+                    start = i
+                    break
+            if start is None:
+                raise ValueError('No JSON object found in LLM output')
+
+            # find matching bracket using stack
+            stack = []
+            end = None
+            pairs = {'{': '}', '[': ']'}
+            open_ch = s[start]
+            close_ch = pairs[open_ch]
+            for i in range(start, len(s)):
+                ch = s[i]
+                if ch == open_ch:
+                    stack.append(ch)
+                elif ch == close_ch:
+                    stack.pop()
+                    if not stack:
+                        end = i
+                        break
+
+            if end is None:
+                # fallback: try to find last closing brace
+                last = s.rfind(close_ch)
+                if last == -1:
+                    raise ValueError('Could not find end of JSON in LLM output')
+                end = last
+
+            candidate = s[start:end+1]
+
+            # try parsing candidate; if fails, attempt simple fixes
+            def escape_newlines_in_strings(text: str) -> str:
+                # Replace raw newline/carriage returns inside JSON string literals with escaped sequences
+                pattern = re.compile(r'"([^"\\]*(?:\\.[^"\\]*)*)"', re.DOTALL)
+                def _repl(m):
+                    inner = m.group(1)
+                    inner_escaped = inner.replace('\r', '\\r').replace('\n', '\\n')
+                    return f'"{inner_escaped}"'
+                return pattern.sub(_repl, text)
+
+            try:
+                return json.loads(candidate)
+            except Exception:
+                # try escaping newlines inside string values
+                try:
+                    candidate_esc = escape_newlines_in_strings(candidate)
+                    return json.loads(candidate_esc)
+                except Exception:
+                    # remove trailing commas before } or ] and escape newlines there too
+                    fixed = re.sub(r",\s*([}\]])", r"\1", candidate)
+                    fixed = escape_newlines_in_strings(fixed)
+                    try:
+                        return json.loads(fixed)
+                    except Exception as e:
+                        # as a last resort, attempt to extract a top-level object with regex
+                        m = re.search(r"(\{[\s\S]*\})", s)
+                        if m:
+                            try:
+                                cand2 = escape_newlines_in_strings(m.group(1))
+                                return json.loads(cand2)
+                            except Exception:
+                                pass
+                        raise e
+
         try:
-            raw_answer = result["answer"]
-            # Clean LLM output (remove fences and stray backticks)
-            cleaned = re.sub(r"^```[a-zA-Z]*", "", raw_answer.strip())
-            cleaned = re.sub(r"```", "", cleaned)
-            cleaned = cleaned.strip()
+            raw_answer = result.get("answer") if isinstance(result, dict) else result
+            parsed = None
+            try:
+                parsed = extract_json_from_text(raw_answer)
+            except Exception as pe:
+                # If the LLM returned a quoted JSON string (stringified JSON), attempt to unquote and parse
+                try:
+                    # strip outer quotes
+                    if isinstance(raw_answer, str) and raw_answer.startswith('"') and raw_answer.endswith('"'):
+                        inner = raw_answer[1:-1]
+                        parsed = extract_json_from_text(inner)
+                except Exception:
+                    pass
 
-            # Ensure valid JSON by fixing common issues like unescaped newlines
-            # Replace raw newlines inside string values with spaces
-            cleaned = re.sub(r"\n(\s+)?", " ", cleaned)
+            if parsed is None:
+                raise ValueError('Unable to parse LLM output as JSON')
 
-            parsed = json.loads(cleaned)
-            if not all(k in parsed for k in ["answer", "sources"]):
-                raise ValueError("Missing required keys in LLM JSON output")
+            # If parsed is still a string containing JSON, parse again
+            if isinstance(parsed, str):
+                try:
+                    parsed = json.loads(parsed)
+                except Exception:
+                    # leave as-is
+                    pass
+
+            if not isinstance(parsed, dict) or not all(k in parsed for k in ["answer", "sources"]):
+                raise ValueError("Parsed JSON did not contain required keys 'answer' and 'sources'")
         except Exception as e:
-            logger.error(f"Failed to parse LLM JSON answer. Raw output was: {raw_answer}")
+            logger.error(f"Failed to parse LLM JSON answer. Raw output was: {raw_answer}", exc_info=True)
             raise HTTPException(status_code=500, detail="Invalid JSON format returned from LLM")
 
         return {
